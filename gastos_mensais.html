@@ -667,28 +667,104 @@
   </div>
 </div>
 
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 const MONTHS = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
-const WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbx9c-3a-9_UiXujegkpqxLPrCwt6-iu1kZTyHyjZeQ_wcUHqT166Grw9muvzjdza5KK/exec';
+const CLIENT_ID = '902746680220-76voqk21lfo7kq6jsbejvr295nqaid5a.apps.googleusercontent.com';
+const FILE_NAME = 'meus-gastos-data.json';
+const SCOPES    = 'https://www.googleapis.com/auth/drive.appdata';
 
 let state = {};
 let currentMonth = new Date().getMonth();
 let currentYear  = new Date().getFullYear();
-let syncPending  = false;
+let accessToken  = null;
 let syncTimer    = null;
+let driveFileId  = null;
 
-// ===== SYNC =====
+// ===== GOOGLE IDENTITY =====
+function initGoogleAuth() {
+  const client = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+    callback: async (resp) => {
+      if (resp.error) { showSyncStatus('erro de login', 'warn'); return; }
+      accessToken = resp.access_token;
+      showSyncStatus('conectado ✓', 'ok');
+      await loadFromCloud();
+    }
+  });
+
+  // tenta silencioso primeiro, se não, mostra botão
+  google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+    prompt: '',
+    callback: async (resp) => {
+      if (resp && !resp.error) {
+        accessToken = resp.access_token;
+        showSyncStatus('conectado ✓', 'ok');
+        await loadFromCloud();
+      } else {
+        showSyncStatus('clique em 🔄 para entrar', 'warn');
+        // fallback local
+        try { state = JSON.parse(localStorage.getItem('mgstos2') || '{}'); } catch { state = {}; }
+        currentMonth = state.currentMonth ?? new Date().getMonth();
+        currentYear  = state.currentYear  ?? new Date().getFullYear();
+        renderAll();
+      }
+    }
+  }).requestAccessToken({ prompt: '' });
+
+  // botão de sync manual faz login se precisar
+  window._driveClient = client;
+}
+
+function manualSync() {
+  if (accessToken) {
+    loadFromCloud();
+  } else {
+    window._driveClient.requestAccessToken();
+  }
+}
+
+// ===== DRIVE APPDATA =====
+async function findOrCreateFile() {
+  // busca arquivo existente
+  const res = await fetch(
+    "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='" + FILE_NAME + "'",
+    { headers: { Authorization: 'Bearer ' + accessToken } }
+  );
+  const data = await res.json();
+  if (data.files && data.files.length > 0) {
+    driveFileId = data.files[0].id;
+    return driveFileId;
+  }
+  // cria se não existe
+  const create = await fetch('https://www.googleapis.com/drive/v3/files', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: FILE_NAME, parents: ['appDataFolder'] })
+  });
+  const created = await create.json();
+  driveFileId = created.id;
+  return driveFileId;
+}
+
 async function loadFromCloud() {
+  if (!accessToken) { manualSync(); return; }
   showSyncStatus('carregando...', 'neutral');
   try {
-    const res = await fetch(WEBAPP_URL + '?t=' + Date.now());
+    const fileId = await findOrCreateFile();
+    const res = await fetch(
+      'https://www.googleapis.com/drive/v3/files/' + fileId + '?alt=media',
+      { headers: { Authorization: 'Bearer ' + accessToken } }
+    );
     const text = await res.text();
-    state = text && text !== '{}' ? JSON.parse(text) : {};
+    state = text && text.trim().startsWith('{') ? JSON.parse(text) : {};
     currentMonth = state.currentMonth ?? new Date().getMonth();
     currentYear  = state.currentYear  ?? new Date().getFullYear();
     showSyncStatus('sincronizado ✓', 'ok');
   } catch(e) {
-    // fallback to localStorage
     try { state = JSON.parse(localStorage.getItem('mgstos2') || '{}'); } catch { state = {}; }
     currentMonth = state.currentMonth ?? new Date().getMonth();
     currentYear  = state.currentYear  ?? new Date().getFullYear();
@@ -700,21 +776,23 @@ async function loadFromCloud() {
 function saveState() {
   state.currentMonth = currentMonth;
   state.currentYear  = currentYear;
-  // salva local imediatamente (rápido)
   localStorage.setItem('mgstos2', JSON.stringify(state));
-  // debounce pra nuvem (evita múltiplas chamadas seguidas)
   clearTimeout(syncTimer);
   showSyncStatus('salvando...', 'neutral');
-  syncTimer = setTimeout(pushToCloud, 800);
+  syncTimer = setTimeout(pushToCloud, 1000);
 }
 
 async function pushToCloud() {
+  if (!accessToken) { showSyncStatus('salvo local (sem login)', 'warn'); return; }
   try {
-    await fetch(WEBAPP_URL, {
-      method: 'POST',
-      body: JSON.stringify(state),
-      headers: { 'Content-Type': 'text/plain' }
-    });
+    const fileId = driveFileId || await findOrCreateFile();
+    const blob = new Blob([JSON.stringify(state)], { type: 'application/json' });
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify({})], { type: 'application/json' }));
+    form.append('file', blob);
+    await fetch('https://www.googleapis.com/upload/drive/v3/files/' + fileId + '?uploadType=multipart',
+      { method: 'PATCH', headers: { Authorization: 'Bearer ' + accessToken }, body: form }
+    );
     showSyncStatus('sincronizado ✓', 'ok');
   } catch(e) {
     showSyncStatus('salvo local (sem internet)', 'warn');
@@ -1024,7 +1102,7 @@ function changeMonth(dir) {
 }
 
 // INIT
-loadFromCloud();
+window.onload = () => { if (window.google) initGoogleAuth(); else setTimeout(initGoogleAuth, 1000); };
 </script>
 </body>
 </html>
